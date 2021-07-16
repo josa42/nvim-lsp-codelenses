@@ -1,6 +1,5 @@
 -- https://github.com/neovim/neovim/blob/bccae5a05aef24e6b94d1433172897b3661c05d9/runtime/lua/vim/lsp/codelens.lua
 
-local au = require('jg.autocmd')
 local util = require('vim.lsp.util')
 local hi = require('jg.highlight')
 
@@ -64,6 +63,31 @@ local function group_by_line(result)
   return lenses_by_line
 end
 
+local function set_virtual_text(bufnr, ns, line, line_lenses)
+  local chunks = {}
+
+  for _, lens in pairs(line_lenses) do
+    if lens.command then
+      if #chunks == 0 then
+        table.insert(chunks, { '‣ ', 'LspCodeLensTextSign'})
+      else
+        table.insert(chunks, { ' | ', 'LspCodeLensTextSeparator'})
+      end
+      table.insert(chunks, { lens.command.title, 'LspCodeLensText'})
+    end
+  end
+
+  api.nvim_buf_set_virtual_text(bufnr, ns, line, chunks, {})
+end
+
+local function set_sign(line)
+  vim.fn.sign_place(
+    new_line, SIGN_GROUP, "LspCodeLensSign", "%",
+    { lnum = line, priority = 1 }
+  )
+end
+
+
 local function render_lenses(client_id, bufnr)
   local ns = namespaces[client_id]
 
@@ -72,61 +96,12 @@ local function render_lenses(client_id, bufnr)
   local buf_lenses = get_lenses(client_id, bufnr)
 
   for line, line_lenses in pairs(group_by_line(buf_lenses)) do
-    local chunks = {}
-
-    for _, lens in pairs(line_lenses) do
-      if lens.command then
-        if #chunks == 0 then
-          table.insert(chunks, { '‣ ', 'LspCodeLensSign'})
-        else
-          table.insert(chunks, { ' | ', 'LspCodeLensSeparator'})
-        end
-        table.insert(chunks, { lens.command.title, 'LspCodeLens'})
-      end
-    end
-
-    api.nvim_buf_set_virtual_text(bufnr, ns, line, chunks, {})
-  end
-end
-
-local function client_supports_method(client, method)
-  local capabilities = client.server_capabilities
-  if method == 'textDocument/codeLens' then
-    return capabilities.codeLensProvider
-  end
-
-  if method == 'codeLens/resolve' then
-    return capabilities.codeLensProvider and capabilities.codeLensProvider.resolveProvider
-  end
-
-  return client.supports_method(method)
-end
-
-local function buf_request(bufnr, method, params, handler)
-  vim.validate {
-    bufnr    = { bufnr, 'n', true };
-    method   = { method, 's' };
-    handler  = { handler, 'f' };
-  }
-  local client_request_ids = {}
-
-  vim.lsp.for_each_buffer_client(bufnr, function(client, client_id, client_bufnr)
-    if client_supports_method(client, method) then
-      local request_success, request_id = client.request(method, params, nil, client_bufnr)
-      if request_success then client_request_ids[client_id] = request_id end
-    end
-  end)
-
-  return function()
-    -- cancel all requests
-    for client_id, request_id in pairs(client_request_ids) do
-      vim.lsp.get_client_by_id(client_id).cancel_request(request_id)
-    end
+    set_virtual_text(bufnr, ns, line, line_lenses)
   end
 end
 
 local function resolve(bufnr, lens, done)
-  local cancel = buf_request(bufnr, 'codeLens/resolve', lens, function(err, _, result, _, _)
+  local cancel = vim.lsp.buf_request(bufnr, 'codeLens/resolve', lens, function(err, _, result, _, _)
     assert(not err, vim.inspect(err))
     if result and result.command then done(result) end
   end)
@@ -135,6 +110,11 @@ local function resolve(bufnr, lens, done)
 end
 
 local function on_codelens(err, _, result, client_id, bufnr)
+  if err ~= nil and err.code == vim.lsp.protocol.ErrorCodes.MethodNotFound then
+    -- none of the running lamguage servers support code lenses
+    return
+  end
+
   assert(not err, vim.inspect(err))
 
   bufnr = bufid(bufnr)
@@ -176,34 +156,33 @@ local function select(title, options, displayName)
   return options[choice]
 end
 
---- Refresh codelenses for the current buffer
-function M.buf_codelenses_refresh()
+local function cancel_active_requests()
   for _, cancel in pairs(active_requests) do cancel() end
   active_requests = {}
+end
 
-  local params = {
+--- Refresh codelenses for the current buffer
+function M.buf_codelenses_refresh()
+  cancel_active_requests()
+
+  local _, cancel = vim.lsp.buf_request(0, 'textDocument/codeLens', {
     textDocument = util.make_text_document_params()
-  }
-
-  local _, cancel = buf_request(0, 'textDocument/codeLens', params, on_codelens)
+  })
 
   table.insert(active_requests, cancel)
 end
 
 function M.setup()
-  hi.link('LspCodeLens', 'Comment')
-  hi.link('LspCodeLensSign', 'LspCodeLens')
-  hi.link('LspCodeLensSeparator', 'LspCodeLens')
+  vim.lsp.handlers['textDocument/codeLens'] = on_codelens
 
-  -- vim.lsp.set_log_level("debug")
-  vim.lsp.handlers['textDocument/codeLens'] = function(...)
-    on_codelens(...)
-  end
+  vim.cmd('highlight! link LspCodeLensText Comment')
+  vim.cmd('highlight! link LspCodeLensTextSign LspCodeLensText')
+  vim.cmd('highlight! link LspCodeLensTextSeparator LspCodeLensText')
 
-  au.group('jg.lsp.codelenses', function(cmd)
-    -- TODO handler server start
-    cmd({ on = { 'BufEnter', 'InsertLeave', 'CursorHold' } }, M.buf_codelenses_refresh)
-  end)
+  vim.cmd('augroup jg.lsp.codelenses')
+  vim.cmd('  autocmd!')
+  vim.cmd('  autocmd BufEnter,InsertLeave,CursorHold * :lua require("jg.lsp.codelenses").buf_codelenses_refresh()')
+  vim.cmd('augroup end')
 end
 
 function M.buf_codelens_action()
